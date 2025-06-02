@@ -22,6 +22,269 @@ from mininet.cli import CLI
 import subprocess
 import random
 
+
+######################################################################################
+##################################### CONFIG MININET ###################################
+
+###############################################
+# Ajout à sdwan_mininet_simulation_fixed.py
+# Visualisation automatique de la topologie
+###############################################
+
+import matplotlib.pyplot as plt
+import networkx as nx
+from matplotlib.patches import Rectangle
+import matplotlib.patches as mpatches
+
+def visualize_topology(save_path=None):
+    """
+    Crée une visualisation professionnelle de la topologie SD-WAN
+    """
+    print("[INFO] Génération de la visualisation de topologie...")
+    
+    # Création du graphe
+    G = nx.Graph()
+    
+    # === AJOUT DES NOEUDS ===
+    
+    # Hôtes Branch A
+    branch_a_hosts = [f'h{i}-a' for i in range(1, HOSTS_PER_BRANCH + 1)]
+    for host in branch_a_hosts:
+        G.add_node(host, node_type='host', branch='A', ip=f'10.1.0.{host[1]}')
+    
+    # Hôtes Branch B  
+    branch_b_hosts = [f'h{i}-b' for i in range(1, HOSTS_PER_BRANCH + 1)]
+    for host in branch_b_hosts:
+        G.add_node(host, node_type='host', branch='B', ip=f'10.2.0.{host[1]}')
+    
+    # Switches
+    switches = {
+        's1': {'type': 'cpe', 'branch': 'A', 'name': 'CPE Branch A'},
+        's2': {'type': 'cpe', 'branch': 'B', 'name': 'CPE Branch B'},
+        's3': {'type': 'wan', 'path': 'MPLS', 'name': 'MPLS Core'},
+        's4': {'type': 'wan', 'path': 'Fiber', 'name': 'Fiber Core'},
+        's5': {'type': 'wan', 'path': '4G', 'name': '4G Core'}
+    }
+    
+    for switch, attrs in switches.items():
+        G.add_node(switch, node_type='switch', **attrs)
+    
+    # === AJOUT DES LIENS ===
+    
+    # Liens hôtes vers CPE
+    for host in branch_a_hosts:
+        G.add_edge(host, 's1', link_type='local', bw='100M')
+    
+    for host in branch_b_hosts:
+        G.add_edge(host, 's2', link_type='local', bw='100M')
+    
+    # Liens WAN
+    wan_links = [
+        ('s1', 's3', {'path': 'MPLS', 'bw': '20M', 'delay': '5ms', 'color': '#2E8B57'}),
+        ('s3', 's2', {'path': 'MPLS', 'bw': '20M', 'delay': '5ms', 'color': '#2E8B57'}),
+        ('s1', 's4', {'path': 'Fiber', 'bw': '100M', 'delay': '10ms', 'color': '#4169E1'}),
+        ('s4', 's2', {'path': 'Fiber', 'bw': '100M', 'delay': '10ms', 'color': '#4169E1'}),
+        ('s1', 's5', {'path': '4G', 'bw': '10M', 'delay': '50ms', 'color': '#FF6347'}),
+        ('s5', 's2', {'path': '4G', 'bw': '10M', 'delay': '50ms', 'color': '#FF6347'})
+    ]
+    
+    for src, dst, attrs in wan_links:
+        G.add_edge(src, dst, link_type='wan', **attrs)
+    
+    # === CRÉATION DE LA VISUALISATION ===
+    
+    plt.figure(figsize=(16, 12))
+    
+    # Positions personnalisées pour une belle disposition
+    pos = {
+        # Branch A (gauche)
+        'h1-a': (-3, 2),
+        'h2-a': (-3, 1),
+        'h3-a': (-3, 0),
+        's1': (-1, 1),
+        
+        # Branch B (droite)
+        'h1-b': (3, 2),
+        'h2-b': (3, 1),
+        'h3-b': (3, 0),
+        's2': (1, 1),
+        
+        # WAN Core (centre)
+        's3': (0, 2),    # MPLS
+        's4': (0, 1),    # Fiber  
+        's5': (0, 0),    # 4G
+    }
+    
+    # === DESSIN DES NOEUDS ===
+    
+    # Hôtes Branch A
+    nx.draw_networkx_nodes(G, pos, nodelist=branch_a_hosts, 
+                          node_color='lightblue', node_size=800, 
+                          node_shape='s', alpha=0.8)
+    
+    # Hôtes Branch B
+    nx.draw_networkx_nodes(G, pos, nodelist=branch_b_hosts,
+                          node_color='lightcoral', node_size=800,
+                          node_shape='s', alpha=0.8)
+    
+    # CPE Switches
+    nx.draw_networkx_nodes(G, pos, nodelist=['s1', 's2'],
+                          node_color='gold', node_size=1200,
+                          node_shape='h', alpha=0.9)
+    
+    # WAN Switches
+    wan_colors = {'s3': '#2E8B57', 's4': '#4169E1', 's5': '#FF6347'}
+    for switch in ['s3', 's4', 's5']:
+        nx.draw_networkx_nodes(G, pos, nodelist=[switch],
+                              node_color=wan_colors[switch], node_size=1000,
+                              node_shape='o', alpha=0.8)
+    
+    # === DESSIN DES LIENS ===
+    
+    # Liens locaux (gris)
+    local_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('link_type') == 'local']
+    nx.draw_networkx_edges(G, pos, edgelist=local_edges,
+                          edge_color='gray', width=2, alpha=0.6)
+    
+    # Liens WAN (colorés selon le type)
+    for src, dst, attrs in wan_links:
+        nx.draw_networkx_edges(G, pos, edgelist=[(src, dst)],
+                              edge_color=attrs['color'], width=4, alpha=0.8)
+    
+    # === LABELS ===
+    
+    # Labels des noeuds
+    labels = {}
+    for node in G.nodes():
+        if node.startswith('h'):
+            labels[node] = node
+        elif node == 's1':
+            labels[node] = 'CPE-A'
+        elif node == 's2':
+            labels[node] = 'CPE-B'
+        elif node == 's3':
+            labels[node] = 'MPLS'
+        elif node == 's4':
+            labels[node] = 'Fiber'
+        elif node == 's5':
+            labels[node] = '4G'
+    
+    nx.draw_networkx_labels(G, pos, labels, font_size=10, font_weight='bold')
+    
+    # === ANNOTATIONS ET LÉGENDES ===
+    
+    # Titre
+    plt.title('Topologie SD-WAN - Équilibrage de Charge Multi-Chemins', 
+              fontsize=16, fontweight='bold', pad=20)
+    
+    # Zones Branch
+    branch_a_rect = Rectangle((-3.5, -0.5), 1, 3, linewidth=2, 
+                             edgecolor='blue', facecolor='lightblue', alpha=0.2)
+    branch_b_rect = Rectangle((2.5, -0.5), 1, 3, linewidth=2,
+                             edgecolor='red', facecolor='lightcoral', alpha=0.2)
+    wan_rect = Rectangle((-0.5, -0.5), 1, 3, linewidth=2,
+                        edgecolor='green', facecolor='lightgreen', alpha=0.2)
+    
+    plt.gca().add_patch(branch_a_rect)
+    plt.gca().add_patch(branch_b_rect)
+    plt.gca().add_patch(wan_rect)
+    
+    # Labels des zones
+    plt.text(-3, -0.8, 'Branch A\n10.1.0.0/24', ha='center', va='top', 
+             fontsize=12, fontweight='bold', color='blue')
+    plt.text(3, -0.8, 'Branch B\n10.2.0.0/24', ha='center', va='top',
+             fontsize=12, fontweight='bold', color='red')
+    plt.text(0, -0.8, 'WAN Core\nSD-WAN Controller', ha='center', va='top',
+             fontsize=12, fontweight='bold', color='green')
+    
+    # Légende des liens WAN
+    legend_elements = [
+        mpatches.Patch(color='#2E8B57', label='MPLS (20Mbps, 5ms, Poids: 3)'),
+        mpatches.Patch(color='#4169E1', label='Fiber (100Mbps, 10ms, Poids: 2)'),
+        mpatches.Patch(color='#FF6347', label='4G (10Mbps, 50ms, Poids: 1)'),
+        mpatches.Patch(color='gray', label='Liens Locaux (100Mbps)')
+    ]
+    
+    plt.legend(handles=legend_elements, loc='upper right', 
+               bbox_to_anchor=(1, 1), fontsize=10)
+    
+    # Informations techniques
+    info_text = """
+ARCHITECTURE SD-WAN
+
+Algorithme: Weighted Round-Robin
+Contrôleur: Ryu OpenFlow 1.3
+Simulation: Mininet + TCLink
+
+Équilibrage intelligent basé sur:
+• Poids des liens WAN
+• Type de trafic
+• Performance en temps réel
+    """
+    
+    plt.text(-4.5, 1, info_text, fontsize=9, verticalalignment='center',
+             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    
+    # Paramètres d'affichage
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # Sauvegarde
+    if save_path is None:
+        save_path = os.path.join(GRAPH_DIR, f'topology_sdwan_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"[INFO] ✓ Topologie sauvegardée: {save_path}")
+    return save_path
+
+# Fonction à ajouter dans main() après le lancement de Mininet
+def capture_topology_during_simulation(net):
+    """
+    Capture la topologie pendant que la simulation tourne
+    """
+    print("[INFO] Capture de la topologie en cours...")
+    
+    # Sauvegarde automatique de la topologie
+    topo_path = visualize_topology()
+    
+    # Optionnel: capture des informations runtime
+    capture_runtime_info(net, topo_path)
+
+def capture_runtime_info(net, topo_path):
+    """
+    Capture des informations runtime de Mininet
+    """
+    runtime_info = {
+        'timestamp': datetime.now().isoformat(),
+        'topology_image': topo_path,
+        'hosts': [],
+        'switches': [],
+        'links': []
+    }
+    
+    # Informations sur les hôtes
+    for host_name in [f'h{i}-a' for i in range(1, 4)] + [f'h{i}-b' for i in range(1, 4)]:
+        host = net.get(host_name)
+        if host:
+            runtime_info['hosts'].append({
+                'name': host_name,
+                'ip': host.IP(),
+                'mac': host.MAC(),
+                'status': 'active'
+            })
+    
+    # Sauvegarde des infos runtime
+    runtime_path = os.path.join(STATS_DIR, 'topology_runtime.json')
+    with open(runtime_path, 'w') as f:
+        json.dump(runtime_info, f, indent=2)
+    
+    print(f"[INFO] ✓ Infos runtime sauvegardées: {runtime_path}")
+
+############################################################################################
+##########################################################################################
+
 # Configuration
 RESULTS_DIR = 'results'
 GRAPH_DIR = os.path.join(RESULTS_DIR, 'graphs')
@@ -589,6 +852,9 @@ def main():
         # Lancement de Mininet
         net = launch_mininet()
         print("[INFO] ✓ Topologie créée avec succès")
+        
+        # 🎨 NOUVEAU: Capture de la topologie
+        capture_topology_during_simulation(net)
         
         # Attendre que tous les switches se connectent
         print("[INFO] Connexion des switches au contrôleur...")

@@ -3,4 +3,5 @@ mininet
 numpy
 matplotlib
 psutil
+networkx
 threading
