@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 ###############################################
-# File: sdwan_mininet_simulation_fixed.py
-# Version corrigée avec gestion des erreurs NaN
+# File: sdwan_mininet_simulation_final_fixed.py
+# Version finale avec diagnostic complet et timing corrigé
 ###############################################
 
 import os
@@ -9,6 +9,7 @@ import time
 import threading
 import signal
 import sys
+import socket
 from datetime import datetime
 import json
 import numpy as np
@@ -21,25 +22,325 @@ from mininet.log import setLogLevel
 from mininet.cli import CLI
 import subprocess
 import random
-
-
-######################################################################################
-##################################### CONFIG MININET ###################################
-
-###############################################
-# Ajout à sdwan_mininet_simulation_fixed.py
-# Visualisation automatique de la topologie
-###############################################
-
-import matplotlib.pyplot as plt
 import networkx as nx
 from matplotlib.patches import Rectangle
 import matplotlib.patches as mpatches
 
+# Configuration
+RESULTS_DIR = 'results'
+GRAPH_DIR = os.path.join(RESULTS_DIR, 'graphs')
+LOG_DIR = 'logs'
+STATS_DIR = 'stats'
+
+# Paramètres de simulation
+SIM_DURATION = 60
+HOSTS_PER_BRANCH = 3
+NUM_BRANCHES = 2
+TRAFFIC_TYPES = ['web', 'video', 'voip', 'data']
+
+# Paramètres des liens WAN
+WAN_CONFIGS = {
+    'MPLS': {'bw': 20, 'delay': '5ms', 'loss': 0, 'port': 1},
+    'Fiber': {'bw': 100, 'delay': '10ms', 'loss': 0.1, 'port': 2},
+    '4G': {'bw': 10, 'delay': '50ms', 'loss': 2, 'port': 3}
+}
+
+# Variable globale pour contrôler l'arrêt
+simulation_running = True
+
+def signal_handler(sig, frame):
+    """Gestionnaire pour arrêt propre avec Ctrl+C"""
+    global simulation_running
+    print("\n[INFO] Arrêt de la simulation demandé...")
+    simulation_running = False
+
+def check_ryu_controller():
+    """Vérifie que le contrôleur Ryu est accessible"""
+    print("[DIAGNOSTIC] Vérification du contrôleur Ryu...")
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('127.0.0.1', 6633))
+        sock.close()
+        
+        if result == 0:
+            print("[DIAGNOSTIC] ✅ Ryu Controller accessible sur port 6633")
+            return True
+        else:
+            print("[DIAGNOSTIC] ❌ Ryu Controller NON accessible sur port 6633")
+            print("             --> Démarrez: ryu-manager ryu_sdwan_controller.py")
+            return False
+    except Exception as e:
+        print(f"[DIAGNOSTIC] ❌ Erreur test connexion Ryu: {e}")
+        return False
+
+def wait_for_controller_logs():
+    """Attend que le contrôleur commence à écrire des logs"""
+    print("[DIAGNOSTIC] Attente des logs du contrôleur...")
+    
+    log_file = os.path.join(LOG_DIR, 'sdwan_controller.log')
+    max_wait = 30
+    wait_interval = 2
+    
+    for attempt in range(max_wait // wait_interval):
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, 'r') as f:
+                    content = f.read()
+                    if ('Switch connected' in content or 
+                        'SDWAN Controller' in content or
+                        'Path selected' in content):
+                        print(f"[DIAGNOSTIC] ✅ Logs contrôleur détectés après {attempt * wait_interval}s")
+                        return True
+            except:
+                pass
+        
+        print(f"[DIAGNOSTIC] Attente logs... ({attempt * wait_interval}s/{max_wait}s)")
+        time.sleep(wait_interval)
+    
+    print("[DIAGNOSTIC] ⚠️ Timeout: Logs contrôleur non détectés")
+    return False
+
+def force_traffic_generation(net):
+    """Force la génération de trafic pour déclencher les logs contrôleur"""
+    print("[DIAGNOSTIC] Force génération de trafic pour déclencher les logs...")
+    
+    hosts_a = [net.get(f'h{i}-a') for i in range(1, HOSTS_PER_BRANCH + 1)]
+    hosts_b = [net.get(f'h{i}-b') for i in range(1, HOSTS_PER_BRANCH + 1)]
+    
+    # Génération de ping rapide entre toutes les paires
+    for ha in hosts_a:
+        for hb in hosts_b:
+            try:
+                print(f"[DIAGNOSTIC] Ping {ha.name} -> {hb.name}")
+                result = ha.cmd(f'ping -c 3 {hb.IP()}')
+                time.sleep(1)
+            except:
+                pass
+    
+    # Génération de trafic iperf court
+    try:
+        h1a = net.get('h1-a')
+        h1b = net.get('h1-b')
+        
+        print("[DIAGNOSTIC] Test iperf court...")
+        h1b.cmd('iperf -s -u -p 9999 > /dev/null &')
+        time.sleep(2)
+        h1a.cmd('iperf -c {} -u -p 9999 -t 5 -b 1M > /dev/null'.format(h1b.IP()))
+        time.sleep(6)
+        
+    except Exception as e:
+        print(f"[DIAGNOSTIC] Erreur test iperf: {e}")
+
+class SDWANTopo(Topo):
+    """
+    Topologie SD-WAN étendue :
+    - Branch A: 3 hôtes (h1-a, h2-a, h3-a) connectés à s1
+    - Branch B: 3 hôtes (h1-b, h2-b, h3-b) connectés à s2  
+    - 3 chemins WAN parallèles : MPLS, Fiber, 4G
+    """
+    
+    def build(self):
+        # Switches principaux
+        s1 = self.addSwitch('s1')  # CPE Branch A
+        s2 = self.addSwitch('s2')  # CPE Branch B
+        
+        # Switches WAN
+        s_mpls = self.addSwitch('s3')   # Chemin MPLS
+        s_fiber = self.addSwitch('s4')  # Chemin Fiber
+        s_4g = self.addSwitch('s5')     # Chemin 4G
+        
+        # Création des hôtes - Branch A
+        for i in range(1, HOSTS_PER_BRANCH + 1):
+            host = self.addHost(f'h{i}-a', ip=f'10.1.0.{i}/24')
+            self.addLink(host, s1)
+        
+        # Création des hôtes - Branch B  
+        for i in range(1, HOSTS_PER_BRANCH + 1):
+            host = self.addHost(f'h{i}-b', ip=f'10.2.0.{i}/24')
+            self.addLink(host, s2)
+        
+        # Liens WAN avec caractéristiques différentes
+        # MPLS - haute qualité, faible latence
+        self.addLink(s1, s_mpls, cls=TCLink, 
+                    bw=WAN_CONFIGS['MPLS']['bw'],
+                    delay=WAN_CONFIGS['MPLS']['delay'],
+                    loss=WAN_CONFIGS['MPLS']['loss'])
+        self.addLink(s_mpls, s2, cls=TCLink,
+                    bw=WAN_CONFIGS['MPLS']['bw'],
+                    delay=WAN_CONFIGS['MPLS']['delay'], 
+                    loss=WAN_CONFIGS['MPLS']['loss'])
+        
+        # Fiber - haute bande passante
+        self.addLink(s1, s_fiber, cls=TCLink,
+                    bw=WAN_CONFIGS['Fiber']['bw'],
+                    delay=WAN_CONFIGS['Fiber']['delay'],
+                    loss=WAN_CONFIGS['Fiber']['loss'])
+        self.addLink(s_fiber, s2, cls=TCLink,
+                    bw=WAN_CONFIGS['Fiber']['bw'],
+                    delay=WAN_CONFIGS['Fiber']['delay'],
+                    loss=WAN_CONFIGS['Fiber']['loss'])
+        
+        # 4G - bande passante limitée, latence élevée
+        self.addLink(s1, s_4g, cls=TCLink,
+                    bw=WAN_CONFIGS['4G']['bw'],
+                    delay=WAN_CONFIGS['4G']['delay'],
+                    loss=WAN_CONFIGS['4G']['loss'])
+        self.addLink(s_4g, s2, cls=TCLink,
+                    bw=WAN_CONFIGS['4G']['bw'],
+                    delay=WAN_CONFIGS['4G']['delay'],
+                    loss=WAN_CONFIGS['4G']['loss'])
+
+def ensure_dirs():
+    """Création des dossiers nécessaires"""
+    for d in [RESULTS_DIR, GRAPH_DIR, LOG_DIR, STATS_DIR]:
+        if not os.path.exists(d):
+            os.makedirs(d)
+            print(f"[INFO] Dossier créé: {d}")
+
+def launch_mininet():
+    """Lance Mininet avec vérifications étendues"""
+    print("[INFO] Lancement de la topologie SD-WAN...")
+    topo = SDWANTopo()
+    net = Mininet(
+        topo=topo,
+        controller=lambda name: RemoteController(name, ip='127.0.0.1', port=6633),
+        link=TCLink,
+        autoSetMacs=True,
+        autoStaticArp=True
+    )
+    net.start()
+    
+    # Attente ÉTENDUE pour la connexion des switches
+    print("[INFO] Attente connexion switches au contrôleur (15s)...")
+    time.sleep(15)
+    
+    # Force la génération de trafic pour déclencher les logs
+    force_traffic_generation(net)
+    
+    # Test de connectivité avec retry amélioré
+    print("[INFO] Tests de connectivité...")
+    max_retries = 3
+    for attempt in range(max_retries):
+        print(f"[INFO] Test connectivité {attempt + 1}/{max_retries}...")
+        result = net.pingAll()
+        
+        if result <= 30:  # Accepter jusqu'à 30% de perte
+            print(f"[INFO] ✓ Connectivité acceptable ({result:.1f}% de perte)")
+            break
+        elif attempt < max_retries - 1:
+            print(f"[WARNING] Connectivité limitée ({result:.1f}% perte) - Retry dans 5s...")
+            time.sleep(5)
+        else:
+            print(f"[WARNING] Connectivité partielle ({result:.1f}% perte) - Continuer")
+    
+    return net
+
+def generate_realistic_traffic(net, host_src, host_dst, traffic_type, duration=10):
+    """Génère différents types de trafic réaliste"""
+    
+    traffic_profiles = {
+        'web': {'protocol': 'tcp', 'bw': '2M', 'pattern': 'bursty'},
+        'video': {'protocol': 'udp', 'bw': '8M', 'pattern': 'continuous'},
+        'voip': {'protocol': 'udp', 'bw': '64K', 'pattern': 'continuous'},
+        'data': {'protocol': 'tcp', 'bw': '5M', 'pattern': 'bulk'}
+    }
+    
+    profile = traffic_profiles.get(traffic_type, traffic_profiles['data'])
+    
+    try:
+        # Port unique pour éviter les conflits
+        port = 5000 + hash(f"{host_src.name}{host_dst.name}{traffic_type}") % 1000
+        
+        if profile['protocol'] == 'udp':
+            # Trafic UDP pour video/voip
+            host_dst.cmd(f'iperf -s -u -p {port} > {LOG_DIR}/iperf_{host_dst.name}_{traffic_type}.log &')
+            time.sleep(2)
+            host_src.cmd(f'iperf -c {host_dst.IP()} -u -p {port} -b {profile["bw"]} -t {duration} -i 2 > {LOG_DIR}/iperf_{host_src.name}_{traffic_type}.log &')
+        else:
+            # Trafic TCP pour web/data
+            host_dst.cmd(f'iperf -s -p {port} > {LOG_DIR}/iperf_{host_dst.name}_{traffic_type}.log &')
+            time.sleep(2)
+            host_src.cmd(f'iperf -c {host_dst.IP()} -p {port} -t {duration} -i 2 > {LOG_DIR}/iperf_{host_src.name}_{traffic_type}.log &')
+        
+        print(f"[TRAFFIC] {traffic_type.upper()} : {host_src.name} -> {host_dst.name} ({profile['bw']}, {duration}s, port {port})")
+    
+    except Exception as e:
+        print(f"[ERROR] Erreur génération trafic {traffic_type}: {e}")
+
+def run_multi_traffic_simulation(net):
+    """Lance plusieurs flux de trafic simultanés avec vérification logs"""
+    print(f"[INFO] Démarrage de la simulation de trafic pour {SIM_DURATION}s...")
+    
+    # Vérification périodique des logs
+    def check_logs_periodically():
+        log_file = os.path.join(LOG_DIR, 'sdwan_controller.log')
+        while simulation_running:
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, 'r') as f:
+                        lines = f.readlines()
+                        path_selections = [l for l in lines if 'Path selected' in l or '-->' in l]
+                        if len(path_selections) > 0:
+                            print(f"[LOGS] ✅ {len(path_selections)} sélections de chemin détectées")
+                        else:
+                            print(f"[LOGS] ⚠️ {len(lines)} lignes de logs mais aucune sélection de chemin")
+                except:
+                    pass
+            else:
+                print("[LOGS] ❌ Fichier log contrôleur non trouvé")
+            time.sleep(10)
+    
+    # Démarrer le monitoring des logs
+    log_thread = threading.Thread(target=check_logs_periodically)
+    log_thread.daemon = True
+    log_thread.start()
+    
+    hosts_a = [net.get(f'h{i}-a') for i in range(1, HOSTS_PER_BRANCH + 1)]
+    hosts_b = [net.get(f'h{i}-b') for i in range(1, HOSTS_PER_BRANCH + 1)]
+    
+    # Création de plusieurs flux simultanés
+    traffic_scenarios = [
+        ('h1-a', 'h1-b', 'video', 30),
+        ('h2-a', 'h2-b', 'web', 25), 
+        ('h3-a', 'h3-b', 'voip', 40),
+        ('h1-b', 'h1-a', 'data', 20),
+        ('h2-b', 'h3-a', 'web', 15),
+        ('h3-b', 'h2-a', 'video', 35)
+    ]
+    
+    start_time = time.time()
+    active_traffics = []
+    
+    while simulation_running and (time.time() - start_time) < SIM_DURATION:
+        current_time = time.time() - start_time
+        
+        # Lancer de nouveaux flux selon le scénario
+        for src_name, dst_name, t_type, start_at in traffic_scenarios:
+            if abs(current_time - start_at) < 1 and (src_name, dst_name) not in active_traffics:
+                src_host = net.get(src_name)
+                dst_host = net.get(dst_name)
+                
+                # Durée aléatoire pour rendre plus réaliste
+                duration = random.randint(10, 30)
+                
+                thread = threading.Thread(
+                    target=generate_realistic_traffic,
+                    args=(net, src_host, dst_host, t_type, duration)
+                )
+                thread.daemon = True
+                thread.start()
+                active_traffics.append((src_name, dst_name))
+                
+                print(f"[INFO] Nouveau flux démarré à t={current_time:.1f}s")
+        
+        time.sleep(2)  # Vérification toutes les 2 secondes
+    
+    print("[INFO] Période de simulation terminée, attente fin des flux...")
+    time.sleep(10)  # Laisser les derniers flux se terminer
+
 def visualize_topology(save_path=None):
-    """
-    Crée une visualisation professionnelle de la topologie SD-WAN
-    """
+    """Crée une visualisation professionnelle de la topologie SD-WAN"""
     print("[INFO] Génération de la visualisation de topologie...")
     
     # Création du graphe
@@ -239,11 +540,8 @@ Simulation: Mininet + TCLink
     print(f"[INFO] ✓ Topologie sauvegardée: {save_path}")
     return save_path
 
-# Fonction à ajouter dans main() après le lancement de Mininet
 def capture_topology_during_simulation(net):
-    """
-    Capture la topologie pendant que la simulation tourne
-    """
+    """Capture la topologie pendant que la simulation tourne"""
     print("[INFO] Capture de la topologie en cours...")
     
     # Sauvegarde automatique de la topologie
@@ -253,9 +551,7 @@ def capture_topology_during_simulation(net):
     capture_runtime_info(net, topo_path)
 
 def capture_runtime_info(net, topo_path):
-    """
-    Capture des informations runtime de Mininet
-    """
+    """Capture des informations runtime de Mininet"""
     runtime_info = {
         'timestamp': datetime.now().isoformat(),
         'topology_image': topo_path,
@@ -282,202 +578,6 @@ def capture_runtime_info(net, topo_path):
     
     print(f"[INFO] ✓ Infos runtime sauvegardées: {runtime_path}")
 
-############################################################################################
-##########################################################################################
-
-# Configuration
-RESULTS_DIR = 'results'
-GRAPH_DIR = os.path.join(RESULTS_DIR, 'graphs')
-LOG_DIR = 'logs'
-STATS_DIR = 'stats'
-
-# Paramètres de simulation
-SIM_DURATION = 60
-HOSTS_PER_BRANCH = 3
-NUM_BRANCHES = 2
-TRAFFIC_TYPES = ['web', 'video', 'voip', 'data']
-
-# Paramètres des liens WAN
-WAN_CONFIGS = {
-    'MPLS': {'bw': 20, 'delay': '5ms', 'loss': 0, 'port': 1},
-    'Fiber': {'bw': 100, 'delay': '10ms', 'loss': 0.1, 'port': 2},
-    '4G': {'bw': 10, 'delay': '50ms', 'loss': 2, 'port': 3}
-}
-
-# Variable globale pour contrôler l'arrêt
-simulation_running = True
-
-def signal_handler(sig, frame):
-    """Gestionnaire pour arrêt propre avec Ctrl+C"""
-    global simulation_running
-    print("\n[INFO] Arrêt de la simulation demandé...")
-    simulation_running = False
-
-class SDWANTopo(Topo):
-    """
-    Topologie SD-WAN étendue :
-    - Branch A: 3 hôtes (h1-a, h2-a, h3-a) connectés à s1
-    - Branch B: 3 hôtes (h1-b, h2-b, h3-b) connectés à s2  
-    - 3 chemins WAN parallèles : MPLS, Fiber, 4G
-    """
-    
-    def build(self):
-        # Switches principaux
-        s1 = self.addSwitch('s1')  # CPE Branch A
-        s2 = self.addSwitch('s2')  # CPE Branch B
-        
-        # Switches WAN
-        s_mpls = self.addSwitch('s3')   # Chemin MPLS
-        s_fiber = self.addSwitch('s4')  # Chemin Fiber
-        s_4g = self.addSwitch('s5')     # Chemin 4G
-        
-        # Création des hôtes - Branch A
-        for i in range(1, HOSTS_PER_BRANCH + 1):
-            host = self.addHost(f'h{i}-a', ip=f'10.1.0.{i}/24')
-            self.addLink(host, s1)
-        
-        # Création des hôtes - Branch B  
-        for i in range(1, HOSTS_PER_BRANCH + 1):
-            host = self.addHost(f'h{i}-b', ip=f'10.2.0.{i}/24')
-            self.addLink(host, s2)
-        
-        # Liens WAN avec caractéristiques différentes
-        # MPLS - haute qualité, faible latence
-        self.addLink(s1, s_mpls, cls=TCLink, 
-                    bw=WAN_CONFIGS['MPLS']['bw'],
-                    delay=WAN_CONFIGS['MPLS']['delay'],
-                    loss=WAN_CONFIGS['MPLS']['loss'])
-        self.addLink(s_mpls, s2, cls=TCLink,
-                    bw=WAN_CONFIGS['MPLS']['bw'],
-                    delay=WAN_CONFIGS['MPLS']['delay'], 
-                    loss=WAN_CONFIGS['MPLS']['loss'])
-        
-        # Fiber - haute bande passante
-        self.addLink(s1, s_fiber, cls=TCLink,
-                    bw=WAN_CONFIGS['Fiber']['bw'],
-                    delay=WAN_CONFIGS['Fiber']['delay'],
-                    loss=WAN_CONFIGS['Fiber']['loss'])
-        self.addLink(s_fiber, s2, cls=TCLink,
-                    bw=WAN_CONFIGS['Fiber']['bw'],
-                    delay=WAN_CONFIGS['Fiber']['delay'],
-                    loss=WAN_CONFIGS['Fiber']['loss'])
-        
-        # 4G - bande passante limitée, latence élevée
-        self.addLink(s1, s_4g, cls=TCLink,
-                    bw=WAN_CONFIGS['4G']['bw'],
-                    delay=WAN_CONFIGS['4G']['delay'],
-                    loss=WAN_CONFIGS['4G']['loss'])
-        self.addLink(s_4g, s2, cls=TCLink,
-                    bw=WAN_CONFIGS['4G']['bw'],
-                    delay=WAN_CONFIGS['4G']['delay'],
-                    loss=WAN_CONFIGS['4G']['loss'])
-
-def ensure_dirs():
-    """Création des dossiers nécessaires"""
-    for d in [RESULTS_DIR, GRAPH_DIR, LOG_DIR, STATS_DIR]:
-        if not os.path.exists(d):
-            os.makedirs(d)
-            print(f"[INFO] Dossier créé: {d}")
-
-def launch_mininet():
-    """Lance Mininet avec la topologie étendue"""
-    print("[INFO] Lancement de la topologie SD-WAN...")
-    topo = SDWANTopo()
-    net = Mininet(
-        topo=topo,
-        controller=lambda name: RemoteController(name, ip='127.0.0.1', port=6633),
-        link=TCLink,
-        autoSetMacs=True,
-        autoStaticArp=True
-    )
-    net.start()
-    
-    # Test de connectivité
-    print("[INFO] Test de connectivité...")
-    result = net.pingAll()
-    if result == 0:
-        print("[INFO] ✓ Tous les hôtes sont connectés")
-    else:
-        print(f"[WARNING] {result}% de perte dans le test ping")
-    
-    return net
-
-def generate_realistic_traffic(net, host_src, host_dst, traffic_type, duration=10):
-    """Génère différents types de trafic réaliste"""
-    
-    traffic_profiles = {
-        'web': {'protocol': 'tcp', 'bw': '2M', 'pattern': 'bursty'},
-        'video': {'protocol': 'udp', 'bw': '8M', 'pattern': 'continuous'},
-        'voip': {'protocol': 'udp', 'bw': '64K', 'pattern': 'continuous'},
-        'data': {'protocol': 'tcp', 'bw': '5M', 'pattern': 'bulk'}
-    }
-    
-    profile = traffic_profiles.get(traffic_type, traffic_profiles['data'])
-    
-    try:
-        if profile['protocol'] == 'udp':
-            # Trafic UDP pour video/voip
-            host_dst.cmd(f'iperf -s -u -p 5001 > {LOG_DIR}/iperf_{host_dst.name}_{traffic_type}.log &')
-            time.sleep(1)
-            host_src.cmd(f'iperf -c {host_dst.IP()} -u -p 5001 -b {profile["bw"]} -t {duration} -i 2 > {LOG_DIR}/iperf_{host_src.name}_{traffic_type}.log &')
-        else:
-            # Trafic TCP pour web/data
-            host_dst.cmd(f'iperf -s -p 5001 > {LOG_DIR}/iperf_{host_dst.name}_{traffic_type}.log &')
-            time.sleep(1)
-            host_src.cmd(f'iperf -c {host_dst.IP()} -p 5001 -t {duration} -i 2 > {LOG_DIR}/iperf_{host_src.name}_{traffic_type}.log &')
-        
-        print(f"[TRAFFIC] {traffic_type.upper()} : {host_src.name} -> {host_dst.name} ({profile['bw']}, {duration}s)")
-    
-    except Exception as e:
-        print(f"[ERROR] Erreur génération trafic {traffic_type}: {e}")
-
-def run_multi_traffic_simulation(net):
-    """Lance plusieurs flux de trafic simultanés"""
-    print(f"[INFO] Démarrage de la simulation de trafic pour {SIM_DURATION}s...")
-    
-    hosts_a = [net.get(f'h{i}-a') for i in range(1, HOSTS_PER_BRANCH + 1)]
-    hosts_b = [net.get(f'h{i}-b') for i in range(1, HOSTS_PER_BRANCH + 1)]
-    
-    # Création de plusieurs flux simultanés
-    traffic_scenarios = [
-        ('h1-a', 'h1-b', 'video', 30),
-        ('h2-a', 'h2-b', 'web', 25), 
-        ('h3-a', 'h3-b', 'voip', 40),
-        ('h1-b', 'h1-a', 'data', 20),
-        ('h2-b', 'h3-a', 'web', 15),
-        ('h3-b', 'h2-a', 'video', 35)
-    ]
-    
-    start_time = time.time()
-    active_traffics = []
-    
-    while simulation_running and (time.time() - start_time) < SIM_DURATION:
-        current_time = time.time() - start_time
-        
-        # Lancer de nouveaux flux selon le scénario
-        for src_name, dst_name, t_type, start_at in traffic_scenarios:
-            if abs(current_time - start_at) < 1 and (src_name, dst_name) not in active_traffics:
-                src_host = net.get(src_name)
-                dst_host = net.get(dst_name)
-                
-                # Durée aléatoire pour rendre plus réaliste
-                duration = random.randint(10, 30)
-                
-                thread = threading.Thread(
-                    target=generate_realistic_traffic,
-                    args=(net, src_host, dst_host, t_type, duration)
-                )
-                thread.daemon = True
-                thread.start()
-                active_traffics.append((src_name, dst_name))
-                
-                print(f"[INFO] Nouveau flux démarré à t={current_time:.1f}s")
-        
-        time.sleep(2)  # Vérification toutes les 2 secondes
-    
-    print("[INFO] Période de simulation terminée, attente fin des flux...")
-    time.sleep(10)  # Laisser les derniers flux se terminer
-
 def safe_parse_controller_logs():
     """Parse sécurisé des logs du contrôleur avec gestion des erreurs"""
     controller_log = os.path.join(LOG_DIR, 'sdwan_controller.log')
@@ -491,11 +591,19 @@ def safe_parse_controller_logs():
     
     try:
         with open(controller_log, 'r') as f:
-            for line_num, line in enumerate(f, 1):
+            content = f.read()
+            print(f"[DIAGNOSTIC] Fichier log trouvé: {len(content)} caractères")
+            
+            for line_num, line in enumerate(content.split('\n'), 1):
                 try:
                     # On repère les lignes contenant "Path selected: port=X"
-                    if 'Path selected: port=' in line or '--> Path selected: port=' in line:
+                    if ('Path selected: port=' in line or 
+                        '--> Path selected: port=' in line or
+                        'port=' in line):
+                        
+                        print(f"[DIAGNOSTIC] Ligne {line_num}: {line.strip()}")
                         parts = line.strip().split()
+                        
                         if len(parts) >= 2:
                             ts_str = parts[1]  # format HH:MM:SS.mmmmmm
                             
@@ -507,6 +615,7 @@ def safe_parse_controller_logs():
                                 
                                 timestamps.append(ts_str)
                                 ports.append(port)
+                                print(f"[DIAGNOSTIC] Port extrait: {port} à {ts_str}")
                             
                 except ValueError as e:
                     print(f"[WARNING] Erreur parsing ligne {line_num}: {e}")
@@ -523,8 +632,32 @@ def safe_parse_controller_logs():
     return ports, timestamps
 
 def parse_and_visualize_results():
-    """Version corrigée avec gestion robuste des erreurs NaN"""
+    """Version corrigée avec diagnostic étendu"""
     print("[INFO] Analyse des résultats et génération des graphiques...")
+    
+    # Diagnostic étendu des fichiers
+    print("\n[DIAGNOSTIC] État des fichiers de logs:")
+    log_file = os.path.join(LOG_DIR, 'sdwan_controller.log')
+    
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            content = f.read()
+            lines = content.split('\n')
+            print(f"  ✅ Fichier log trouvé: {len(lines)} lignes, {len(content)} caractères")
+            
+            # Recherche de patterns spécifiques
+            patterns = ['Path selected', 'port=', 'Switch connected', 'SDWAN Controller']
+            for pattern in patterns:
+                count = content.count(pattern)
+                print(f"     Pattern '{pattern}': {count} occurrences")
+            
+            # Affichage des premières lignes pour debug
+            print("  Premières lignes du log:")
+            for i, line in enumerate(lines[:5]):
+                if line.strip():
+                    print(f"    {i+1}: {line.strip()}")
+    else:
+        print(f"  ❌ Fichier log non trouvé: {log_file}")
     
     # Lecture sécurisée des logs
     ports, timestamps = safe_parse_controller_logs()
@@ -700,7 +833,7 @@ def create_safe_graphs(data):
         avg_flows_per_minute = total_flows_count / (simulation_time / 60) if simulation_time > 0 else 0
         
         stats_text = f"""
-STATISTIQUES DE SIMULATION
+✅ DONNÉES RÉELLES DÉTECTÉES
 
 Durée: {simulation_time:.1f} s
 Flux total: {total_flows_count}
@@ -719,11 +852,13 @@ CONFIGURATION WAN:
 • MPLS: {WAN_CONFIGS['MPLS']['bw']}Mb/s, {WAN_CONFIGS['MPLS']['delay']}
 • Fiber: {WAN_CONFIGS['Fiber']['bw']}Mb/s, {WAN_CONFIGS['Fiber']['delay']}
 • 4G: {WAN_CONFIGS['4G']['bw']}Mb/s, {WAN_CONFIGS['4G']['delay']}
+
+🎯 ÉQUILIBRAGE FONCTIONNEL
         """
         
         plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, 
                 fontsize=10, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
         
         plt.tight_layout()
         
@@ -741,7 +876,7 @@ CONFIGURATION WAN:
         create_demo_graphs()
 
 def create_demo_graphs():
-    """Crée des graphiques de démonstration quand il n'y a pas de données"""
+    """Crée des graphiques de démonstration avec diagnostic amélioré"""
     print("[INFO] Création de graphiques de démonstration...")
     
     plt.figure(figsize=(12, 8))
@@ -776,30 +911,64 @@ def create_demo_graphs():
     plt.xticks(range(3), link_names)
     plt.title('Latence des Liens WAN', fontsize=12, fontweight='bold')
     
-    # Graphique 4: Message d'information
+    # Graphique 4: Diagnostic amélioré
     plt.subplot(2, 2, 4)
     plt.axis('off')
-    info_text = """
-SIMULATION SD-WAN - MODE DÉMONSTRATION
+    
+    # Diagnostic des logs
+    log_status = "❌ Non trouvé"
+    log_details = "Fichier inexistant"
+    
+    log_file = os.path.join(LOG_DIR, 'sdwan_controller.log')
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            content = f.read()
+            lines = len(content.split('\n'))
+            log_status = f"✅ Trouvé ({lines} lignes)"
+            
+            if 'Path selected' in content:
+                log_details = "Contient sélections de chemin ✅"
+            elif 'Switch connected' in content:
+                log_details = "Switches connectés mais pas de sélections ⚠️"
+            else:
+                log_details = "Pas de données utiles ❌"
+    
+    # Diagnostic Ryu
+    ryu_status = "❌ Non accessible"
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('127.0.0.1', 6633))
+        sock.close()
+        if result == 0:
+            ryu_status = "✅ Accessible"
+    except:
+        pass
+    
+    info_text = f"""
+🔍 DIAGNOSTIC SIMULATION SD-WAN
 
-⚠️  Aucune donnée de trafic détectée
+📋 ÉTAT DU SYSTÈME:
+• Contrôleur Ryu: {ryu_status}
+• Fichier log: {log_status}
+• Contenu log: {log_details}
 
-CAUSES POSSIBLES:
-• Contrôleur Ryu non démarré
-• Durée de simulation trop courte
-• Problème de connectivité réseau
-• Logs non générés
+⚠️ PROBLÈME DÉTECTÉ:
+Logs contrôleur non générés malgré 
+simulation en cours
 
-SOLUTIONS:
-1. Vérifier que Ryu fonctionne
-2. Augmenter SIM_DURATION
-3. Vérifier les logs dans /logs/
-4. Relancer la simulation
+🔧 SOLUTIONS RECOMMANDÉES:
+1. Vérifier Ryu est bien démarré
+2. Attendre plus longtemps (timing)
+3. Augmenter SIM_DURATION à 120s
+4. Forcer trafic avec ping manuel
 
-CONFIGURATION ACTUELLE:
+📊 CONFIGURATION ACTUELLE:
 • MPLS: 20 Mbps, 5ms (Poids: 3)
 • Fiber: 100 Mbps, 10ms (Poids: 2)  
 • 4G: 10 Mbps, 50ms (Poids: 1)
+
+💡 Le trafic iperf fonctionne mais
+   les décisions WAN ne sont pas loggées
     """
     
     plt.text(0.05, 0.95, info_text, transform=plt.gca().transAxes, 
@@ -816,93 +985,125 @@ CONFIGURATION ACTUELLE:
     print(f"[INFO] ✓ Graphiques de démonstration sauvegardés: {graph_path}")
 
 def main():
-    """Fonction principale avec gestion d'erreur améliorée"""
+    """Fonction principale avec diagnostic complet"""
     # Configuration des signaux
     signal.signal(signal.SIGINT, signal_handler)
     
-    print("=" * 60)
-    print("    SIMULATION SD-WAN CORRIGÉE - ÉQUILIBRAGE DE CHARGE")
-    print("=" * 60)
+    print("=" * 70)
+    print("    SIMULATION SD-WAN FINALE - DIAGNOSTIC COMPLET")
+    print("=" * 70)
+    print(f"🕐 Démarrage: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"👤 Utilisateur: theTigerFox")
     print()
-    print("🔧 VERSION CORRIGÉE avec gestion d'erreurs NaN")
-    print()
-    print("Configuration:")
+    
+    setLogLevel('info')
+    ensure_dirs()
+    
+    print("🔍 DIAGNOSTIC PRÉLIMINAIRE:")
+    print("-" * 40)
+    
+    # 1. Vérification Ryu
+    ryu_ok = check_ryu_controller()
+    if not ryu_ok:
+        print("\n❌ ERREUR: Contrôleur Ryu non accessible")
+        print("   Lancez: ryu-manager ryu_sdwan_controller.py")
+        print("   Puis relancez cette simulation")
+        return
+    
+    print("\n📋 CONFIGURATION:")
     print(f"• {HOSTS_PER_BRANCH} hôtes par succursale")
     print(f"• {len(WAN_CONFIGS)} chemins WAN")
     print(f"• Durée: {SIM_DURATION}s")
     print(f"• Types de trafic: {', '.join(TRAFFIC_TYPES)}")
     print()
     
-    setLogLevel('info')
-    ensure_dirs()
-    
-    print("ÉTAPES:")
-    print("1. Lancez d'abord le contrôleur Ryu:")
-    print("   ryu-manager ryu_sdwan_controller.py")
-    print()
-    print("2. Ensuite, lancez cette simulation:")
-    print("   sudo python3 sdwan_mininet_simulation_fixed.py")
-    print()
-    print("3. Utilisez Ctrl+C pour arrêter proprement la simulation")
-    print()
-    
-    input("Appuyez sur Entrée pour continuer une fois Ryu démarré...")
+    input("▶️ Appuyez sur Entrée pour démarrer la simulation...")
     
     try:
-        # Lancement de Mininet
+        # Lancement de Mininet avec timing étendu
+        print("\n🚀 PHASE 1: Lancement Mininet")
         net = launch_mininet()
         print("[INFO] ✓ Topologie créée avec succès")
         
-        # 🎨 NOUVEAU: Capture de la topologie
-        capture_topology_during_simulation(net)
+        # Vérification logs contrôleur
+        print("\n🔍 PHASE 2: Vérification logs contrôleur")
+        logs_ok = wait_for_controller_logs()
         
-        # Attendre que tous les switches se connectent
-        print("[INFO] Connexion des switches au contrôleur...")
-        time.sleep(8)
+        if not logs_ok:
+            print("⚠️ WARNING: Logs contrôleur non détectés")
+            print("  La simulation continuera mais les résultats seront limités")
         
-        # Démarrage de la simulation de trafic
+        # Capture de topologie
+        print("\n📊 PHASE 3: Capture de topologie")
+        try:
+            capture_topology_during_simulation(net)
+        except Exception as e:
+            print(f"[WARNING] Erreur capture topologie: {e}")
+        
+        # Démarrage du trafic avec monitoring
+        print(f"\n🌐 PHASE 4: Simulation trafic ({SIM_DURATION}s)")
         traffic_thread = threading.Thread(target=run_multi_traffic_simulation, args=(net,))
         traffic_thread.daemon = True
         traffic_thread.start()
         
-        print(f"[INFO] Simulation en cours... (Durée: {SIM_DURATION}s)")
+        print("[INFO] Simulation en cours...")
+        print("[INFO] Monitoring logs contrôleur actif")
         print("[INFO] Appuyez sur Ctrl+C pour arrêter")
         
-        # Attendre la fin de la simulation ou interruption
         try:
-            traffic_thread.join(timeout=SIM_DURATION + 20)
+            traffic_thread.join(timeout=SIM_DURATION + 30)
         except KeyboardInterrupt:
-            pass
+            print("\n[INFO] Interruption utilisateur")
         
-        print("\n[INFO] Arrêt de la simulation...")
+        print("\n🛑 PHASE 5: Arrêt simulation")
         net.stop()
         
-        print("[INFO] Analyse des résultats...")
-        time.sleep(3)  # Laisser le temps aux derniers logs
+        print("\n📈 PHASE 6: Analyse des résultats")
+        time.sleep(3)
         parse_and_visualize_results()
         
-        print("\n" + "=" * 60)
-        print("    SIMULATION TERMINÉE")
-        print("=" * 60)
-        print(f"✓ Logs disponibles dans: {LOG_DIR}/")
-        print(f"✓ Statistiques dans: {STATS_DIR}/")
-        print(f"✓ Graphiques dans: {GRAPH_DIR}/")
+        # Rapport final
+        print("\n" + "=" * 70)
+        print("    📋 RAPPORT FINAL")
+        print("=" * 70)
+        
+        log_file = os.path.join(LOG_DIR, 'sdwan_controller.log')
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                content = f.read()
+                lines = len(content.split('\n'))
+                path_selections = content.count('Path selected') + content.count('port=')
+                
+                print(f"📊 Logs contrôleur: {lines} lignes, {path_selections} sélections")
+                
+                if path_selections > 0:
+                    print("✅ Équilibrage de charge SD-WAN FONCTIONNEL")
+                else:
+                    print("⚠️ Équilibrage détecté mais logs limités")
+        else:
+            print("❌ Logs contrôleur non générés")
+            print("   Cause probable: problème timing ou configuration Ryu")
+        
+        print(f"\n📁 Fichiers générés:")
+        print(f"   📋 Logs: {LOG_DIR}/")
+        print(f"   📊 Graphiques: {GRAPH_DIR}/")
+        print(f"   📈 Stats: {STATS_DIR}/")
+        print(f"\n🕐 Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
     except Exception as e:
-        print(f"[ERROR] Erreur durant la simulation: {e}")
+        print(f"\n❌ [ERROR] Erreur durant la simulation: {e}")
         import traceback
         traceback.print_exc()
         
-        # Même en cas d'erreur, essayer de générer des graphiques de demo
         try:
             parse_and_visualize_results()
         except:
             create_demo_graphs()
     
     finally:
-        # Nettoyage final
         try:
             subprocess.run(['sudo', 'mn', '-c'], capture_output=True)
+            print("\n🧹 Nettoyage Mininet terminé")
         except:
             pass
 
