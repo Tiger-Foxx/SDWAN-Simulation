@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 ###############################################
-# File: ryu_sdwan_controller.py
-# Contrôleur Ryu SD-WAN avec équilibrage de charge intelligent
+# File: ryu_sdwan_controller_fixed.py
+# Contrôleur Ryu SD-WAN avec logs compatibles simulation
 ###############################################
 
 from ryu.base import app_manager
@@ -40,13 +40,23 @@ class SDWANController(app_manager.RyuApp):
             if not os.path.exists(d):
                 os.makedirs(d)
         
-        # Configuration du logging détaillé
+        # ✅ CORRECTION 1: Configuration logging avec format timestamp simple
+        # Supprimer le logging existant et reconfigurer
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+            
         logging.basicConfig(
             filename=LOG_FILE,
-            format='%(asctime)s | %(levelname)s | %(message)s',
+            format='%(asctime)s %(message)s',
+            datefmt='%H:%M:%S.%f',
             level=logging.INFO,
             filemode='w'
         )
+        
+        # ✅ AJOUT: Logger console pour debug
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s', '%H:%M:%S.%f'))
+        logging.getLogger().addHandler(console_handler)
         
         # Structures de données
         self.mac_to_port = {}
@@ -70,10 +80,13 @@ class SDWANController(app_manager.RyuApp):
         self.reset_interval = 15
         self.stats_thread = hub.spawn(self._periodic_stats_collection)
         
+        # ✅ CORRECTION 2: Logs d'initialisation au bon format
         logging.info("=== SDWAN Controller Initialized ===")
         logging.info(f"WAN Paths configured: {len(WAN_PATHS)}")
         for path_id, config in WAN_PATHS.items():
             logging.info(f"Path {path_id}: {config['name']} (weight: {config['weight']}, priority: {config['priority']})")
+            
+        print(f"[CONTROLLER] Log file created: {LOG_FILE}")
 
     def _periodic_stats_collection(self):
         """Collecte périodique des statistiques"""
@@ -95,8 +108,11 @@ class SDWANController(app_manager.RyuApp):
                 logging.info(f"Path {path_id} ({stats['name']}): {stats['counter']} flows, {stats['packets_sent']} packets")
             
             # Sauvegarde JSON
-            with open(STATS_FILE, 'w') as f:
-                json.dump(self.stats_history, f, indent=2)
+            try:
+                with open(STATS_FILE, 'w') as f:
+                    json.dump(self.stats_history, f, indent=2)
+            except Exception as e:
+                logging.error(f"Error saving stats: {e}")
             
             # Reset des compteurs pour la prochaine période
             for path_id in self.path_counters:
@@ -112,6 +128,7 @@ class SDWANController(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         
         logging.info(f"Switch connected: DPID {datapath.id}")
+        print(f"[CONTROLLER] Switch {datapath.id} connected")
         
         # Installation de la table-miss
         match = parser.OFPMatch()
@@ -139,10 +156,7 @@ class SDWANController(app_manager.RyuApp):
 
     def select_path_intelligent(self, src_ip=None, dst_ip=None, protocol=None):
         """
-        Sélection intelligente de chemin basée sur :
-        - Weighted Round Robin
-        - Type de trafic (priorité)
-        - Performance historique
+        ✅ CORRECTION 3: Sélection intelligente avec logs compatibles
         """
         
         # Algorithme de base : Weighted Round Robin
@@ -164,11 +178,39 @@ class SDWANController(app_manager.RyuApp):
         self.path_counters[best_path]['counter'] += 1
         self.path_counters[best_path]['packets_sent'] += 1
         
+        # ✅ CORRECTION 4: Log au format attendu par la simulation
+        path_name = WAN_PATHS[best_path]['name']
+        logging.info(f"Path selected: port={best_path} ({path_name})")
+        print(f"[CONTROLLER] --> Path selected: port={best_path} ({path_name})")
+        
         return best_path
+
+    def _is_inter_branch_traffic(self, src_ip, dst_ip):
+        """
+        ✅ CORRECTION 5: Détection du trafic inter-branches
+        """
+        if not src_ip or not dst_ip:
+            return False
+            
+        # Branch A: 10.1.0.x, Branch B: 10.2.0.x
+        src_branch = None
+        dst_branch = None
+        
+        if src_ip.startswith('10.1.0.'):
+            src_branch = 'A'
+        elif src_ip.startswith('10.2.0.'):
+            src_branch = 'B'
+            
+        if dst_ip.startswith('10.1.0.'):
+            dst_branch = 'A'
+        elif dst_ip.startswith('10.2.0.'):
+            dst_branch = 'B'
+            
+        return src_branch and dst_branch and src_branch != dst_branch
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Gestionnaire principal des paquets entrants"""
+        """✅ CORRECTION 6: Gestionnaire avec forced WAN routing"""
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -198,30 +240,38 @@ class SDWANController(app_manager.RyuApp):
         # Apprentissage MAC
         self.mac_to_port[dpid][src] = in_port
         
-        # Décision de routage
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-            decision_type = "LOCAL_LEARNED"
-        else:
+        # ✅ DÉCISION DE ROUTAGE FORCÉE POUR TRAFIC INTER-BRANCHES
+        decision_type = "LOCAL"
+        out_port = None
+        
+        # Forcer l'équilibrage pour trafic inter-branches
+        if self._is_inter_branch_traffic(src_ip, dst_ip):
             out_port = self.select_path_intelligent(src_ip, dst_ip, protocol)
             decision_type = "WAN_LOAD_BALANCED"
             
-            # Log détaillé de la décision
-            path_info = WAN_PATHS.get(out_port, {})
-            logging.info(f"FLOW_DECISION | SRC: {src_ip} | DST: {dst_ip} | "
-                        f"PATH: {out_port} ({path_info.get('name', 'Unknown')}) | "
-                        f"TYPE: {decision_type} | PROTOCOL: {protocol}")
+            logging.info(f"Inter-branch traffic: {src_ip} -> {dst_ip} via port {out_port}")
+            
+        # Routage local normal
+        elif dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+            decision_type = "LOCAL_LEARNED"
+        else:
+            # ✅ FALLBACK: Si destination inconnue, forcer équilibrage WAN
+            out_port = self.select_path_intelligent(src_ip, dst_ip, protocol)
+            decision_type = "WAN_UNKNOWN_DST"
+            
+            logging.info(f"Unknown destination: {dst} -> routing via WAN port {out_port}")
         
         actions = [parser.OFPActionOutput(out_port)]
         
-        # Installation du flow avec timeout
+        # Installation du flow avec timeout plus court pour plus d'activité
         if msg.buffer_id != ofproto.OFP_NO_BUFFER:
             match = parser.OFPMatch(eth_dst=dst, eth_src=src)
-            self.add_flow(datapath, 1, match, actions, msg.buffer_id, idle_timeout=30)
+            self.add_flow(datapath, 1, match, actions, msg.buffer_id, idle_timeout=10)  # Réduit de 30 à 10
             return
         
         match = parser.OFPMatch(eth_dst=dst, eth_src=src)
-        self.add_flow(datapath, 1, match, actions, idle_timeout=30)
+        self.add_flow(datapath, 1, match, actions, idle_timeout=10)  # Réduit de 30 à 10
         
         # Envoi du paquet
         data = None
