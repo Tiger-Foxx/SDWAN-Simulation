@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 ###############################################
-# File: sdwan_mininet_simulation.py
-# Simulation SD-WAN avancée avec multiples hôtes et traffic varié
+# File: sdwan_mininet_simulation_fixed.py
+# Version corrigée avec gestion des erreurs NaN
 ###############################################
 
 import os
@@ -29,8 +29,8 @@ LOG_DIR = 'logs'
 STATS_DIR = 'stats'
 
 # Paramètres de simulation
-SIM_DURATION = 60  # Durée plus longue pour plus de données
-HOSTS_PER_BRANCH = 3  # 3 hôtes par succursale
+SIM_DURATION = 60
+HOSTS_PER_BRANCH = 3
 NUM_BRANCHES = 2
 TRAFFIC_TYPES = ['web', 'video', 'voip', 'data']
 
@@ -69,17 +69,13 @@ class SDWANTopo(Topo):
         s_4g = self.addSwitch('s5')     # Chemin 4G
         
         # Création des hôtes - Branch A
-        branch_a_hosts = []
         for i in range(1, HOSTS_PER_BRANCH + 1):
             host = self.addHost(f'h{i}-a', ip=f'10.1.0.{i}/24')
-            branch_a_hosts.append(host)
             self.addLink(host, s1)
         
         # Création des hôtes - Branch B  
-        branch_b_hosts = []
         for i in range(1, HOSTS_PER_BRANCH + 1):
             host = self.addHost(f'h{i}-b', ip=f'10.2.0.{i}/24')
-            branch_b_hosts.append(host)
             self.addLink(host, s2)
         
         # Liens WAN avec caractéristiques différentes
@@ -179,8 +175,6 @@ def run_multi_traffic_simulation(net):
     hosts_a = [net.get(f'h{i}-a') for i in range(1, HOSTS_PER_BRANCH + 1)]
     hosts_b = [net.get(f'h{i}-b') for i in range(1, HOSTS_PER_BRANCH + 1)]
     
-    traffic_threads = []
-    
     # Création de plusieurs flux simultanés
     traffic_scenarios = [
         ('h1-a', 'h1-b', 'video', 30),
@@ -212,7 +206,6 @@ def run_multi_traffic_simulation(net):
                 )
                 thread.daemon = True
                 thread.start()
-                traffic_threads.append(thread)
                 active_traffics.append((src_name, dst_name))
                 
                 print(f"[INFO] Nouveau flux démarré à t={current_time:.1f}s")
@@ -222,236 +215,353 @@ def run_multi_traffic_simulation(net):
     print("[INFO] Période de simulation terminée, attente fin des flux...")
     time.sleep(10)  # Laisser les derniers flux se terminer
 
-def parse_and_visualize_results():
-    """Analyse des logs et création de graphiques avancés"""
-    print("[INFO] Analyse des résultats et génération des graphiques...")
-    
-    # Lecture des statistiques du contrôleur
-    stats_file = os.path.join(STATS_DIR, 'path_statistics.json')
+def safe_parse_controller_logs():
+    """Parse sécurisé des logs du contrôleur avec gestion des erreurs"""
     controller_log = os.path.join(LOG_DIR, 'sdwan_controller.log')
     
-    if not os.path.exists(stats_file):
-        print(f"[WARNING] Fichier de stats non trouvé: {stats_file}")
-        return
+    if not os.path.isfile(controller_log):
+        print(f"[WARNING] Fichier de log non trouvé: {controller_log}")
+        return [], []
     
-    # Chargement des données
-    with open(stats_file, 'r') as f:
-        stats_data = json.load(f)
-    
-    if not stats_data:
-        print("[WARNING] Aucune donnée de statistiques trouvée")
-        return
-    
-    # Extraction des données pour visualisation
+    ports = []
     timestamps = []
-    path_data = {1: [], 2: [], 3: []}  # MPLS, Fiber, 4G
     
-    for entry in stats_data:
-        timestamps.append(datetime.fromisoformat(entry['timestamp']))
-        for path_id in [1, 2, 3]:
-            if str(path_id) in entry['paths']:
-                path_data[path_id].append(entry['paths'][str(path_id)]['counter'])
-            else:
-                path_data[path_id].append(0)
+    try:
+        with open(controller_log, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                try:
+                    # On repère les lignes contenant "Path selected: port=X"
+                    if 'Path selected: port=' in line or '--> Path selected: port=' in line:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            ts_str = parts[1]  # format HH:MM:SS.mmmmmm
+                            
+                            # Extraction du port de manière plus robuste
+                            port_part = line.strip().split('port=')
+                            if len(port_part) >= 2:
+                                port_str = port_part[1].split()[0]  # Premier mot après port=
+                                port = int(port_str)
+                                
+                                timestamps.append(ts_str)
+                                ports.append(port)
+                            
+                except ValueError as e:
+                    print(f"[WARNING] Erreur parsing ligne {line_num}: {e}")
+                    continue
+                except IndexError as e:
+                    print(f"[WARNING] Format ligne invalide {line_num}: {e}")
+                    continue
+                    
+    except Exception as e:
+        print(f"[ERROR] Erreur lecture fichier log: {e}")
+        return [], []
     
-    if not timestamps:
-        print("[WARNING] Aucune donnée temporelle trouvée")
+    print(f"[INFO] Données extraites: {len(ports)} sélections de chemin")
+    return ports, timestamps
+
+def parse_and_visualize_results():
+    """Version corrigée avec gestion robuste des erreurs NaN"""
+    print("[INFO] Analyse des résultats et génération des graphiques...")
+    
+    # Lecture sécurisée des logs
+    ports, timestamps = safe_parse_controller_logs()
+    
+    # Vérification des données
+    if not ports or len(ports) == 0:
+        print("[WARNING] Aucune sélection de chemin trouvée - Génération de données de démonstration")
+        create_demo_graphs()
         return
     
-    # Graphique 1: Répartition globale du trafic
-    plt.figure(figsize=(15, 10))
+    print(f"[INFO] Analyse de {len(ports)} sélections de chemin")
     
-    plt.subplot(2, 3, 1)
-    total_flows = [sum(path_data[p]) for p in [1, 2, 3]]
-    labels = ['MPLS\n(Poids: 3)', 'Fiber\n(Poids: 2)', '4G\n(Poids: 1)']
-    colors = ['#2E8B57', '#4169E1', '#FF6347']
+    # Conversion des timestamps en secondes relatives
+    times_sec = []
+    if timestamps:
+        try:
+            fmt = '%H:%M:%S.%f'
+            import datetime
+            t0 = datetime.datetime.strptime(timestamps[0], fmt)
+            
+            for ts in timestamps:
+                try:
+                    t = datetime.datetime.strptime(ts, fmt)
+                    delta = (t - t0).total_seconds()
+                    times_sec.append(delta)
+                except ValueError:
+                    # Si le format ne marche pas, utiliser l'index comme temps
+                    times_sec.append(len(times_sec))
+                    
+        except Exception as e:
+            print(f"[WARNING] Erreur conversion timestamps: {e}")
+            # Fallback: utiliser des index comme temps
+            times_sec = list(range(len(ports)))
     
-    wedges, texts, autotexts = plt.pie(total_flows, labels=labels, colors=colors, 
-                                      autopct='%1.1f%%', startangle=90)
-    plt.title('Répartition du Trafic par Chemin WAN', fontsize=14, fontweight='bold')
+    # Assemblage des données avec vérification
+    data = {
+        'port': np.array(ports, dtype=int),
+        'time': np.array(times_sec, dtype=float)
+    }
     
-    # Graphique 2: Évolution temporelle
-    plt.subplot(2, 3, 2)
-    time_minutes = [(t - timestamps[0]).total_seconds() / 60 for t in timestamps]
-    
-    for path_id, label, color in zip([1, 2, 3], ['MPLS', 'Fiber', '4G'], colors):
-        plt.plot(time_minutes, path_data[path_id], marker='o', 
-                label=label, color=color, linewidth=2, markersize=4)
-    
-    plt.xlabel('Temps (minutes)')
-    plt.ylabel('Nombre de flux')
-    plt.title('Évolution du Nombre de Flux par Période', fontsize=14, fontweight='bold')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Graphique 3: Histogramme comparatif avec poids théoriques
-    plt.subplot(2, 3, 3)
-    actual_ratios = np.array(total_flows) / sum(total_flows) * 100 if sum(total_flows) > 0 else [0, 0, 0]
-    theoretical_ratios = np.array([3, 2, 1]) / 6 * 100  # Basé sur les poids
-    
-    x = np.arange(3)
-    width = 0.35
-    
-    plt.bar(x - width/2, actual_ratios, width, label='Réel', color=colors, alpha=0.8)
-    plt.bar(x + width/2, theoretical_ratios, width, label='Théorique', 
-           color='gray', alpha=0.6, edgecolor='black')
-    
-    plt.xlabel('Chemins WAN')
-    plt.ylabel('Pourcentage (%)')
-    plt.title('Comparaison Réel vs Théorique', fontsize=14, fontweight='bold')
-    plt.xticks(x, labels)
-    plt.legend()
-    
-    # Graphique 4: Analyse des performances par type de lien
-    plt.subplot(2, 3, 4)
-    link_names = ['MPLS', 'Fiber', '4G']
-    bandwidths = [WAN_CONFIGS[name]['bw'] for name in link_names]
-    delays = [int(WAN_CONFIGS[name]['delay'].replace('ms', '')) for name in link_names]
-    
-    # Graphique à deux axes
-    fig, ax1 = plt.subplots()
-    color = 'tab:blue'
-    ax1.set_xlabel('Chemins WAN')
-    ax1.set_ylabel('Bande Passante (Mbps)', color=color)
-    bars1 = ax1.bar([0, 1, 2], bandwidths, alpha=0.6, color=color)
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_xticks([0, 1, 2])
-    ax1.set_xticklabels(link_names)
-    
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('Latence (ms)', color=color)
-    line = ax2.plot([0, 1, 2], delays, color=color, marker='o', linewidth=3, markersize=8)
-    ax2.tick_params(axis='y', labelcolor=color)
-    
-    plt.title('Caractéristiques des Liens WAN')
-    
-    # Repositionner le subplot
-    plt.subplot(2, 3, 4)
-    plt.bar(range(3), bandwidths, alpha=0.6, color='tab:blue', label='BP (Mbps)')
-    plt.ylabel('Bande Passante (Mbps)')
-    plt.xlabel('Chemins WAN')
-    plt.xticks(range(3), link_names)
-    plt.title('Bande Passante par Lien', fontsize=12, fontweight='bold')
-    
-    # Graphique 5: Efficacité de l'équilibrage
-    plt.subplot(2, 3, 5)
-    if sum(total_flows) > 0:
-        efficiency = []
-        for i, (actual, theoretical) in enumerate(zip(actual_ratios, theoretical_ratios)):
-            eff = 100 - abs(actual - theoretical)
-            efficiency.append(max(0, eff))
+    # Création des graphiques avec gestion d'erreur
+    create_safe_graphs(data)
+
+def create_safe_graphs(data):
+    """Création sécurisée des graphiques avec gestion NaN"""
+    try:
+        plt.figure(figsize=(15, 10))
         
-        bars = plt.bar(range(3), efficiency, color=['green' if e > 80 else 'orange' if e > 60 else 'red' for e in efficiency])
-        plt.ylabel('Efficacité (%)')
+        # Données pour les graphiques
+        unique_ports = np.unique(data['port'])
+        unique_ports = unique_ports[~np.isnan(unique_ports)]  # Retirer les NaN
+        
+        if len(unique_ports) == 0:
+            print("[WARNING] Aucun port valide trouvé")
+            create_demo_graphs()
+            return
+        
+        # Calcul des counts avec vérification
+        counts = []
+        for p in unique_ports:
+            count = np.sum(data['port'] == p)
+            counts.append(max(0, count))  # S'assurer que count >= 0
+        
+        # Vérification que counts n'est pas vide
+        if not counts or sum(counts) == 0:
+            print("[WARNING] Aucune donnée valide pour les graphiques")
+            create_demo_graphs()
+            return
+        
+        # 1) Histogramme du nombre de sélections par port
+        plt.subplot(2, 3, 1)
+        labels = [f'Port {int(p)}' for p in unique_ports]
+        colors = ['#2E8B57', '#4169E1', '#FF6347'][:len(unique_ports)]
+        
+        # S'assurer qu'il n'y a pas de NaN dans counts
+        counts_clean = [c if not np.isnan(c) else 0 for c in counts]
+        
+        wedges, texts, autotexts = plt.pie(counts_clean, labels=labels, colors=colors, 
+                                          autopct='%1.1f%%', startangle=90)
+        plt.title('Répartition du Trafic par Chemin WAN', fontsize=14, fontweight='bold')
+        
+        # 2) Courbe temporelle des sélections de port
+        plt.subplot(2, 3, 2)
+        for i, port in enumerate(unique_ports):
+            mask = (data['port'] == port)
+            color = colors[i % len(colors)]
+            
+            # Filtrer les NaN
+            time_data = data['time'][mask]
+            port_data = data['port'][mask]
+            
+            # Retirer les NaN
+            valid_mask = ~(np.isnan(time_data) | np.isnan(port_data))
+            time_clean = time_data[valid_mask]
+            port_clean = port_data[valid_mask]
+            
+            if len(time_clean) > 0:
+                plt.plot(time_clean, port_clean, 'o', label=f'Port {int(port)}', 
+                        color=color, alpha=0.6, markersize=4)
+        
+        plt.xlabel('Temps (s)')
+        plt.ylabel('Port sélectionné')
+        plt.title('Évolution temporelle des choix de port WAN', fontsize=14, fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 3) Graphique comparatif avec poids théoriques
+        plt.subplot(2, 3, 3)
+        actual_ratios = np.array(counts_clean) / sum(counts_clean) * 100 if sum(counts_clean) > 0 else [0] * len(counts_clean)
+        
+        # Poids théoriques basés sur la configuration
+        theoretical_weights = {1: 3, 2: 2, 3: 1}  # MPLS, Fiber, 4G
+        theoretical_ratios = []
+        total_weight = sum(theoretical_weights.values())
+        
+        for port in unique_ports:
+            weight = theoretical_weights.get(int(port), 1)
+            ratio = weight / total_weight * 100
+            theoretical_ratios.append(ratio)
+        
+        x = np.arange(len(unique_ports))
+        width = 0.35
+        
+        plt.bar(x - width/2, actual_ratios, width, label='Réel', color=colors[:len(unique_ports)], alpha=0.8)
+        plt.bar(x + width/2, theoretical_ratios, width, label='Théorique', 
+               color='gray', alpha=0.6, edgecolor='black')
+        
         plt.xlabel('Chemins WAN')
-        plt.title('Efficacité de l\'Équilibrage', fontsize=12, fontweight='bold')
-        plt.xticks(range(3), link_names)
-        plt.ylim(0, 100)
+        plt.ylabel('Pourcentage (%)')
+        plt.title('Comparaison Réel vs Théorique', fontsize=14, fontweight='bold')
+        plt.xticks(x, labels)
+        plt.legend()
         
-        # Ajout des valeurs sur les barres
-        for bar, eff in zip(bars, efficiency):
-            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                    f'{eff:.1f}%', ha='center', va='bottom', fontweight='bold')
-    
-    # Graphique 6: Résumé statistique
-    plt.subplot(2, 3, 6)
-    plt.axis('off')
-    
-    # Calcul des statistiques
-    total_simulation_time = (timestamps[-1] - timestamps[0]).total_seconds() / 60 if len(timestamps) > 1 else 0
-    total_flows_count = sum(total_flows)
-    avg_flows_per_minute = total_flows_count / total_simulation_time if total_simulation_time > 0 else 0
-    
-    stats_text = f"""
+        # 4) Caractéristiques des liens WAN
+        plt.subplot(2, 3, 4)
+        link_names = ['MPLS', 'Fiber', '4G']
+        bandwidths = [WAN_CONFIGS[name]['bw'] for name in link_names]
+        link_colors = ['#2E8B57', '#4169E1', '#FF6347']
+        
+        plt.bar(range(3), bandwidths, alpha=0.7, color=link_colors)
+        plt.ylabel('Bande Passante (Mbps)')
+        plt.xlabel('Liens WAN')
+        plt.xticks(range(3), link_names)
+        plt.title('Capacité des Liens WAN', fontsize=12, fontweight='bold')
+        
+        # 5) Efficacité de l'équilibrage
+        plt.subplot(2, 3, 5)
+        if len(actual_ratios) == len(theoretical_ratios):
+            efficiency = []
+            for actual, theoretical in zip(actual_ratios, theoretical_ratios):
+                eff = 100 - abs(actual - theoretical)
+                efficiency.append(max(0, eff))
+            
+            bars = plt.bar(range(len(unique_ports)), efficiency, 
+                          color=['green' if e > 80 else 'orange' if e > 60 else 'red' for e in efficiency])
+            plt.ylabel('Efficacité (%)')
+            plt.xlabel('Chemins WAN')
+            plt.title('Efficacité de l\'Équilibrage', fontsize=12, fontweight='bold')
+            plt.xticks(range(len(unique_ports)), labels)
+            plt.ylim(0, 100)
+            
+            # Ajout des valeurs sur les barres
+            for bar, eff in zip(bars, efficiency):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                        f'{eff:.1f}%', ha='center', va='bottom', fontweight='bold')
+        
+        # 6) Résumé statistique
+        plt.subplot(2, 3, 6)
+        plt.axis('off')
+        
+        total_flows_count = sum(counts_clean)
+        simulation_time = max(data['time']) - min(data['time']) if len(data['time']) > 1 else 0
+        avg_flows_per_minute = total_flows_count / (simulation_time / 60) if simulation_time > 0 else 0
+        
+        stats_text = f"""
 STATISTIQUES DE SIMULATION
 
-Durée totale: {total_simulation_time:.1f} min
-Nombre total de flux: {total_flows_count}
-Flux par minute: {avg_flows_per_minute:.1f}
+Durée: {simulation_time:.1f} s
+Flux total: {total_flows_count}
+Flux/min: {avg_flows_per_minute:.1f}
 
 RÉPARTITION:
-• MPLS: {total_flows[0]} flux ({actual_ratios[0]:.1f}%)
-• Fiber: {total_flows[1]} flux ({actual_ratios[1]:.1f}%)
-• 4G: {total_flows[2]} flux ({actual_ratios[2]:.1f}%)
-
+"""
+        
+        # Ajout des stats par port
+        for i, port in enumerate(unique_ports):
+            port_name = {1: 'MPLS', 2: 'Fiber', 3: '4G'}.get(int(port), f'Port{int(port)}')
+            stats_text += f"• {port_name}: {counts_clean[i]} flux ({actual_ratios[i]:.1f}%)\n"
+        
+        stats_text += f"""
 CONFIGURATION WAN:
 • MPLS: {WAN_CONFIGS['MPLS']['bw']}Mb/s, {WAN_CONFIGS['MPLS']['delay']}
 • Fiber: {WAN_CONFIGS['Fiber']['bw']}Mb/s, {WAN_CONFIGS['Fiber']['delay']}
 • 4G: {WAN_CONFIGS['4G']['bw']}Mb/s, {WAN_CONFIGS['4G']['delay']}
+        """
+        
+        plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, 
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
+        plt.tight_layout()
+        
+        # Sauvegarde
+        graph_path = os.path.join(GRAPH_DIR, f'sdwan_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(graph_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[INFO] ✓ Graphiques sauvegardés: {graph_path}")
+        
+    except Exception as e:
+        print(f"[ERROR] Erreur lors de la création des graphiques: {e}")
+        import traceback
+        traceback.print_exc()
+        create_demo_graphs()
+
+def create_demo_graphs():
+    """Crée des graphiques de démonstration quand il n'y a pas de données"""
+    print("[INFO] Création de graphiques de démonstration...")
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Données de démonstration
+    demo_ports = [1, 2, 3]
+    demo_counts = [30, 20, 10]  # Simulation basée sur les poids 3:2:1
+    demo_labels = ['MPLS (Poids: 3)', 'Fiber (Poids: 2)', '4G (Poids: 1)']
+    colors = ['#2E8B57', '#4169E1', '#FF6347']
+    
+    # Graphique 1: Répartition théorique
+    plt.subplot(2, 2, 1)
+    plt.pie(demo_counts, labels=demo_labels, colors=colors, autopct='%1.1f%%', startangle=90)
+    plt.title('Répartition Théorique du Trafic SD-WAN', fontsize=14, fontweight='bold')
+    
+    # Graphique 2: Configuration des liens
+    plt.subplot(2, 2, 2)
+    link_names = ['MPLS', 'Fiber', '4G']
+    bandwidths = [20, 100, 10]
+    plt.bar(range(3), bandwidths, color=colors, alpha=0.7)
+    plt.ylabel('Bande Passante (Mbps)')
+    plt.xlabel('Liens WAN')
+    plt.xticks(range(3), link_names)
+    plt.title('Capacité des Liens WAN', fontsize=12, fontweight='bold')
+    
+    # Graphique 3: Latence
+    plt.subplot(2, 2, 3)
+    latencies = [5, 10, 50]
+    plt.bar(range(3), latencies, color=colors, alpha=0.7)
+    plt.ylabel('Latence (ms)')
+    plt.xlabel('Liens WAN')
+    plt.xticks(range(3), link_names)
+    plt.title('Latence des Liens WAN', fontsize=12, fontweight='bold')
+    
+    # Graphique 4: Message d'information
+    plt.subplot(2, 2, 4)
+    plt.axis('off')
+    info_text = """
+SIMULATION SD-WAN - MODE DÉMONSTRATION
+
+⚠️  Aucune donnée de trafic détectée
+
+CAUSES POSSIBLES:
+• Contrôleur Ryu non démarré
+• Durée de simulation trop courte
+• Problème de connectivité réseau
+• Logs non générés
+
+SOLUTIONS:
+1. Vérifier que Ryu fonctionne
+2. Augmenter SIM_DURATION
+3. Vérifier les logs dans /logs/
+4. Relancer la simulation
+
+CONFIGURATION ACTUELLE:
+• MPLS: 20 Mbps, 5ms (Poids: 3)
+• Fiber: 100 Mbps, 10ms (Poids: 2)  
+• 4G: 10 Mbps, 50ms (Poids: 1)
     """
     
-    plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, 
-            fontsize=10, verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    plt.text(0.05, 0.95, info_text, transform=plt.gca().transAxes, 
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
     
     plt.tight_layout()
     
     # Sauvegarde
-    graph_path = os.path.join(GRAPH_DIR, f'sdwan_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+    graph_path = os.path.join(GRAPH_DIR, f'sdwan_demo_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
     plt.savefig(graph_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"[INFO] ✓ Graphiques sauvegardés: {graph_path}")
-    
-    # Graphique supplémentaire: Timeline détaillée
-    create_detailed_timeline_graph(stats_data)
-
-def create_detailed_timeline_graph(stats_data):
-    """Crée un graphique timeline détaillé"""
-    plt.figure(figsize=(16, 8))
-    
-    timestamps = [datetime.fromisoformat(entry['timestamp']) for entry in stats_data]
-    time_minutes = [(t - timestamps[0]).total_seconds() / 60 for t in timestamps]
-    
-    # Données cumulatives
-    cumulative_data = {1: [], 2: [], 3: []}
-    running_totals = {1: 0, 2: 0, 3: 0}
-    
-    for entry in stats_data:
-        for path_id in [1, 2, 3]:
-            if str(path_id) in entry['paths']:
-                running_totals[path_id] += entry['paths'][str(path_id)]['counter']
-            cumulative_data[path_id].append(running_totals[path_id])
-    
-    # Graphique en aires empilées
-    colors = ['#2E8B57', '#4169E1', '#FF6347']
-    labels = ['MPLS (Poids: 3)', 'Fiber (Poids: 2)', '4G (Poids: 1)']
-    
-    plt.stackplot(time_minutes, 
-                 cumulative_data[1], cumulative_data[2], cumulative_data[3],
-                 labels=labels, colors=colors, alpha=0.7)
-    
-    plt.xlabel('Temps (minutes)', fontsize=12)
-    plt.ylabel('Flux Cumulés', fontsize=12)
-    plt.title('Évolution Cumulative du Trafic par Chemin WAN', fontsize=14, fontweight='bold')
-    plt.legend(loc='upper left')
-    plt.grid(True, alpha=0.3)
-    
-    # Ajout d'annotations pour les périodes importantes
-    if len(time_minutes) > 10:
-        mid_point = len(time_minutes) // 2
-        plt.annotate('Pic d\'activité', 
-                    xy=(time_minutes[mid_point], sum(cumulative_data[p][mid_point] for p in [1,2,3])),
-                    xytext=(time_minutes[mid_point] + 2, sum(cumulative_data[p][mid_point] for p in [1,2,3]) + 10),
-                    arrowprops=dict(arrowstyle='->', color='red'),
-                    fontsize=10, color='red')
-    
-    plt.tight_layout()
-    timeline_path = os.path.join(GRAPH_DIR, f'timeline_cumulative_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-    plt.savefig(timeline_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"[INFO] ✓ Timeline détaillée sauvegardée: {timeline_path}")
+    print(f"[INFO] ✓ Graphiques de démonstration sauvegardés: {graph_path}")
 
 def main():
-    """Fonction principale"""
+    """Fonction principale avec gestion d'erreur améliorée"""
     # Configuration des signaux
     signal.signal(signal.SIGINT, signal_handler)
     
     print("=" * 60)
-    print("    SIMULATION SD-WAN AVANCÉE - ÉQUILIBRAGE DE CHARGE")
+    print("    SIMULATION SD-WAN CORRIGÉE - ÉQUILIBRAGE DE CHARGE")
     print("=" * 60)
+    print()
+    print("🔧 VERSION CORRIGÉE avec gestion d'erreurs NaN")
     print()
     print("Configuration:")
     print(f"• {HOSTS_PER_BRANCH} hôtes par succursale")
@@ -468,7 +578,7 @@ def main():
     print("   ryu-manager ryu_sdwan_controller.py")
     print()
     print("2. Ensuite, lancez cette simulation:")
-    print("   sudo python3 sdwan_mininet_simulation.py")
+    print("   sudo python3 sdwan_mininet_simulation_fixed.py")
     print()
     print("3. Utilisez Ctrl+C pour arrêter proprement la simulation")
     print()
@@ -516,6 +626,12 @@ def main():
         print(f"[ERROR] Erreur durant la simulation: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Même en cas d'erreur, essayer de générer des graphiques de demo
+        try:
+            parse_and_visualize_results()
+        except:
+            create_demo_graphs()
     
     finally:
         # Nettoyage final
