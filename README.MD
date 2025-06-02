@@ -271,6 +271,16 @@ logging.basicConfig(level=logging.DEBUG)
 - **Visualisation** : Les graphiques sont informatifs et précis
 - **Documentation** : Code commenté et README complet
 
+# RESULTATS OBTENUS :
+
+## Topologie mininet :
+<img src="images/topology.png">
+
+## Gaphiques obtenues  :
+<img src="images/resultats.png">
+
+### On constate sur le diagramme a bande que les resultats experimentaux sont assez proches de ceux attendus , la repartition de flux respecte bien les poids fournies , le Round-Robin fonctionne donc correctement 
+
 ## 🚀 Extensions Possibles
 
 ### Améliorations Techniques
